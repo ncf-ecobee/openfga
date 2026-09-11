@@ -2,8 +2,12 @@ package oidc
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -510,6 +514,253 @@ func TestNewRemoteOidcAuthenticator_RequiresIssuerAndAudience(t *testing.T) {
 	})
 }
 
+func TestValidateSigningAlgorithms(t *testing.T) {
+	tests := []struct {
+		name              string
+		signingAlgorithms []string
+		expectedErr       error
+	}{
+		{
+			name:              "empty_means_the_default_applies",
+			signingAlgorithms: nil,
+		},
+		{
+			name:              "RS256_is_supported",
+			signingAlgorithms: []string{"RS256"},
+		},
+		{
+			name:              "ES256_is_supported",
+			signingAlgorithms: []string{"ES256"},
+		},
+		{
+			name:              "RS256_and_ES256_can_be_combined",
+			signingAlgorithms: []string{"RS256", "ES256"},
+		},
+		{
+			name:              "every_supported_algorithm_is_accepted",
+			signingAlgorithms: SupportedSigningAlgorithms(),
+		},
+		// a symmetric algorithm would let anyone holding the issuer's public key forge tokens
+		{
+			name:              "HS256_is_rejected",
+			signingAlgorithms: []string{"HS256"},
+			expectedErr:       ErrUnsupportedSigningAlgorithm,
+		},
+		{
+			name:              "none_is_rejected",
+			signingAlgorithms: []string{"none"},
+			expectedErr:       ErrUnsupportedSigningAlgorithm,
+		},
+		{
+			name:              "an_unknown_algorithm_is_rejected",
+			signingAlgorithms: []string{"not-an-algorithm"},
+			expectedErr:       ErrUnsupportedSigningAlgorithm,
+		},
+		{
+			name:              "algorithm_names_are_case_sensitive",
+			signingAlgorithms: []string{"es256"},
+			expectedErr:       ErrUnsupportedSigningAlgorithm,
+		},
+		// nothing trims the entries, so `RS256, ES256` in a config file or environment variable
+		// yields a second entry of " ES256", which must be reported rather than quietly ignored
+		{
+			name:              "an_entry_with_surrounding_whitespace_is_rejected",
+			signingAlgorithms: []string{"RS256", " ES256"},
+			expectedErr:       ErrUnsupportedSigningAlgorithm,
+		},
+		{
+			name:              "one_unsupported_algorithm_rejects_the_whole_list",
+			signingAlgorithms: []string{"RS256", "HS256"},
+			expectedErr:       ErrUnsupportedSigningAlgorithm,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateSigningAlgorithms(tc.signingAlgorithms)
+			if tc.expectedErr == nil {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, tc.expectedErr)
+		})
+	}
+}
+
+func TestNewRemoteOidcAuthenticator_SigningAlgorithms(t *testing.T) {
+	tests := []struct {
+		name               string
+		options            []RemoteOidcAuthenticatorOption
+		expectedAlgorithms []string
+	}{
+		{
+			name:               "defaults_to_RS256_when_unset",
+			expectedAlgorithms: []string{"RS256"},
+		},
+		{
+			name:               "an_empty_option_value_leaves_the_default_in_place",
+			options:            []RemoteOidcAuthenticatorOption{WithSigningAlgorithms(nil)},
+			expectedAlgorithms: []string{"RS256"},
+		},
+		{
+			name:               "configured_algorithms_are_kept",
+			options:            []RemoteOidcAuthenticatorOption{WithSigningAlgorithms([]string{"RS256", "ES256"})},
+			expectedAlgorithms: []string{"RS256", "ES256"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			withMockedJWKS(t)
+
+			authenticator, err := NewRemoteOidcAuthenticator("https://issuer.example.com", nil, "some-audience", nil, nil, tc.options...)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedAlgorithms, authenticator.SigningAlgorithms)
+		})
+	}
+
+	t.Run("an_unsupported_algorithm_fails_without_fetching_keys", func(t *testing.T) {
+		orig := fetchJWKs
+		t.Cleanup(func() { fetchJWKs = orig })
+		fetched := false
+		fetchJWKs = func(oidc *RemoteOidcAuthenticator) error {
+			fetched = true
+			return nil
+		}
+
+		_, err := NewRemoteOidcAuthenticator("https://issuer.example.com", nil, "some-audience", nil, nil,
+			WithSigningAlgorithms([]string{"HS256"}))
+		require.ErrorIs(t, err, ErrUnsupportedSigningAlgorithm)
+		require.False(t, fetched, "keys must not be fetched when the configuration is invalid")
+	})
+}
+
+func TestRemoteOidcAuthenticator_Authenticate_SigningAlgorithms(t *testing.T) {
+	tests := []struct {
+		testDescription   string
+		jwkAlgorithm      string
+		tokenAlgorithm    string
+		signingAlgorithms []string
+		expectAuthorized  bool
+	}{
+		{
+			testDescription:   "an_ES256_token_is_accepted_when_ES256_is_configured",
+			jwkAlgorithm:      "ES256",
+			tokenAlgorithm:    "ES256",
+			signingAlgorithms: []string{"ES256"},
+			expectAuthorized:  true,
+		},
+		{
+			testDescription:   "an_ES256_token_is_accepted_when_RS256_and_ES256_are_configured",
+			jwkAlgorithm:      "ES256",
+			tokenAlgorithm:    "ES256",
+			signingAlgorithms: []string{"RS256", "ES256"},
+			expectAuthorized:  true,
+		},
+		{
+			testDescription:   "an_RS256_token_is_accepted_when_RS256_and_ES256_are_configured",
+			jwkAlgorithm:      "RS256",
+			tokenAlgorithm:    "RS256",
+			signingAlgorithms: []string{"RS256", "ES256"},
+			expectAuthorized:  true,
+		},
+		{
+			testDescription:   "an_ES256_token_is_rejected_when_only_RS256_is_configured",
+			jwkAlgorithm:      "ES256",
+			tokenAlgorithm:    "ES256",
+			signingAlgorithms: []string{"RS256"},
+			expectAuthorized:  false,
+		},
+		{
+			testDescription:   "an_RS256_token_is_rejected_when_only_ES256_is_configured",
+			jwkAlgorithm:      "RS256",
+			tokenAlgorithm:    "RS256",
+			signingAlgorithms: []string{"ES256"},
+			expectAuthorized:  false,
+		},
+	}
+
+	for _, testC := range tests {
+		t.Run(testC.testDescription, func(t *testing.T) {
+			authenticator, requestContext := signingAlgorithmSetup(t, testC.jwkAlgorithm, testC.tokenAlgorithm, testC.signingAlgorithms)
+
+			authClaims, err := authenticator.Authenticate(requestContext)
+			if !testC.expectAuthorized {
+				require.ErrorIs(t, err, errInvalidClaims)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, "openfga client", authClaims.Subject)
+		})
+	}
+
+	// RFC 8725 §2.1: the verification key is public, so an HMAC-signed token must never be trusted
+	t.Run("an_HS256_token_signed_with_the_issuer's_public_key_is_rejected", func(t *testing.T) {
+		publicKey := withMockedJWKS(t)
+
+		authenticator, err := NewRemoteOidcAuthenticator("right_issuer", nil, "right_audience", nil, nil,
+			WithSigningAlgorithms([]string{"RS256", "ES256"}))
+		require.NoError(t, err)
+
+		_, err = authenticator.Authenticate(generateContext(forgeHS256Token(t, publicKey)))
+		require.ErrorIs(t, err, errInvalidClaims)
+	})
+
+	// An authenticator built without the constructor has no signing algorithms set, which makes jwt
+	// skip its algorithm check. The JWKS here publishes no "alg" either, as many real issuers do,
+	// so this pins the behavior down to the authenticator itself.
+	t.Run("an_authenticator_with_no_signing_algorithms_set_still_rejects_an_HS256_token", func(t *testing.T) {
+		_, publicKey := generateJWTSignatureKeys()
+
+		authenticator := &RemoteOidcAuthenticator{
+			MainIssuer: "right_issuer",
+			Audience:   "right_audience",
+		}
+		require.NoError(t, fetchKeysMockForAlgorithm(publicKey, "kid_1", "")(authenticator))
+		require.Empty(t, authenticator.SigningAlgorithms)
+
+		_, err := authenticator.Authenticate(generateContext(forgeHS256Token(t, publicKey)))
+		require.ErrorIs(t, err, errInvalidClaims)
+	})
+}
+
+// signingAlgorithmSetup builds an authenticator that trusts signingAlgorithms, whose issuer
+// publishes a key for jwkAlgorithm, along with a request context carrying a token signed with
+// tokenAlgorithm by that same key.
+func signingAlgorithmSetup(t *testing.T, jwkAlgorithm, tokenAlgorithm string, signingAlgorithms []string) (*RemoteOidcAuthenticator, context.Context) {
+	t.Helper()
+
+	const kid = "kid_1"
+
+	var privateKey crypto.Signer
+	var publicKey any
+	switch jwkAlgorithm {
+	case "RS256":
+		rsaPrivateKey, rsaPublicKey := generateJWTSignatureKeys()
+		privateKey, publicKey = rsaPrivateKey, rsaPublicKey
+	case "ES256":
+		ecdsaPrivateKey, ecdsaPublicKey := generateES256SignatureKeys()
+		privateKey, publicKey = ecdsaPrivateKey, ecdsaPublicKey
+	default:
+		t.Fatalf("unsupported JWK algorithm %q", jwkAlgorithm)
+	}
+
+	orig := fetchJWKs
+	t.Cleanup(func() { fetchJWKs = orig })
+	fetchJWKs = fetchKeysMockForAlgorithm(publicKey, kid, jwkAlgorithm)
+
+	authenticator, err := NewRemoteOidcAuthenticator("right_issuer", nil, "right_audience", nil, nil,
+		WithSigningAlgorithms(signingAlgorithms))
+	require.NoError(t, err)
+
+	token := jwt.NewWithClaims(jwt.GetSigningMethod(tokenAlgorithm), validClaims())
+	token.Header["kid"] = kid
+	signedToken, err := token.SignedString(privateKey)
+	require.NoError(t, err)
+
+	return authenticator, generateContext(signedToken)
+}
+
 type Config struct {
 	jwkKid             string
 	jwtKid             string
@@ -562,11 +813,67 @@ func generateJWTSignatureKeys() (*rsa.PrivateKey, *rsa.PublicKey) {
 	return privateKey, &privateKey.PublicKey
 }
 
+// generateES256SignatureKeys generates an ECDSA P-256 private key for signing ES256 JWT tokens
+// and a corresponding public key for verifying ES256 JWT token signatures.
+func generateES256SignatureKeys() (*ecdsa.PrivateKey, *ecdsa.PublicKey) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		log.Fatal("Private key cannot be created.", err.Error())
+	}
+	return privateKey, &privateKey.PublicKey
+}
+
 // fetchKeysMock returns a function that sets up a mock JWKS.
 func fetchKeysMock(publicKey *rsa.PublicKey, kid string) func(oidc *RemoteOidcAuthenticator) error {
-	// Create a keyfunc with the given RSA public key and RS256 algorithm
+	return fetchKeysMockForAlgorithm(publicKey, kid, "RS256")
+}
+
+// withMockedJWKS points the package-level key fetcher at a freshly generated RSA key for the
+// duration of the test, and returns the matching public key.
+func withMockedJWKS(t *testing.T) *rsa.PublicKey {
+	t.Helper()
+
+	orig := fetchJWKs
+	t.Cleanup(func() { fetchJWKs = orig })
+	_, publicKey := generateJWTSignatureKeys()
+	fetchJWKs = fetchKeysMock(publicKey, "kid_1")
+
+	return publicKey
+}
+
+// validClaims returns claims that satisfy every check the authenticator makes other than the
+// signature, so that a test asserts on signing algorithms alone.
+func validClaims() jwt.MapClaims {
+	return jwt.MapClaims{
+		"iss": "right_issuer",
+		"aud": "right_audience",
+		"sub": "openfga client",
+		"exp": time.Now().Add(10 * time.Minute).Unix(),
+	}
+}
+
+// forgeHS256Token signs a token with the issuer's public key used as an HMAC secret. It imitates a
+// caller who knows the public key, because the issuer publishes it in its JWKS, and tries to pass
+// off a symmetric signature as the issuer's own.
+func forgeHS256Token(t *testing.T, publicKey *rsa.PublicKey) string {
+	t.Helper()
+
+	publicKeyBytes, err := x509.MarshalPKIXPublicKey(publicKey)
+	require.NoError(t, err)
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, validClaims())
+	token.Header["kid"] = "kid_1"
+	forgedToken, err := token.SignedString(publicKeyBytes)
+	require.NoError(t, err)
+
+	return forgedToken
+}
+
+// fetchKeysMockForAlgorithm returns a function that sets up a mock JWKS holding the given public
+// key for the given signing algorithm.
+func fetchKeysMockForAlgorithm(publicKey any, kid, algorithm string) func(oidc *RemoteOidcAuthenticator) error {
 	givenKeys := keyfunc.NewGivenCustom(publicKey, keyfunc.GivenKeyOptions{
-		Algorithm: "RS256",
+		Algorithm: algorithm,
 	})
 	// Return a function that sets up the mock JWKS with the provided kid
 	return func(oidc *RemoteOidcAuthenticator) error {

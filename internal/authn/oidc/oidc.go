@@ -25,16 +25,28 @@ import (
 )
 
 type RemoteOidcAuthenticator struct {
-	MainIssuer     string
-	IssuerAliases  []string
-	Audience       string
-	Subjects       []string
-	ClientIDClaims []string
+	MainIssuer        string
+	IssuerAliases     []string
+	Audience          string
+	Subjects          []string
+	ClientIDClaims    []string
+	SigningAlgorithms []string
 
 	JwksURI string
 	JWKs    *keyfunc.JWKS
 
 	httpClient *http.Client
+}
+
+// RemoteOidcAuthenticatorOption configures optional behavior of a RemoteOidcAuthenticator.
+type RemoteOidcAuthenticatorOption func(*RemoteOidcAuthenticator)
+
+// WithSigningAlgorithms sets the JWT signing algorithms the authenticator accepts. An empty
+// slice leaves the default in place.
+func WithSigningAlgorithms(signingAlgorithms []string) RemoteOidcAuthenticatorOption {
+	return func(oidc *RemoteOidcAuthenticator) {
+		oidc.SigningAlgorithms = slices.Clone(signingAlgorithms)
+	}
 }
 
 var (
@@ -46,14 +58,56 @@ var (
 )
 
 var (
-	ErrMissingIssuer   = errors.New("oidc: issuer must be set")
-	ErrMissingAudience = errors.New("oidc: audience must be set")
+	ErrMissingIssuer               = errors.New("oidc: issuer must be set")
+	ErrMissingAudience             = errors.New("oidc: audience must be set")
+	ErrUnsupportedSigningAlgorithm = errors.New("oidc: unsupported signing algorithm")
 )
+
+// supportedSigningAlgorithms lists the JWT signing algorithms an operator may configure.
+//
+// Every entry is asymmetric on purpose. A symmetric algorithm (the HS family) or "none" must never
+// be accepted here: the verification key comes from the issuer's public JWKS, so an HMAC algorithm
+// would let anyone who can read that JWKS sign a token with the published public key and have it
+// accepted as genuine. See RFC 8725 §2.1 and §3.1.
+var supportedSigningAlgorithms = []string{
+	"RS256", "RS384", "RS512",
+	"PS256", "PS384", "PS512",
+	"ES256", "ES384", "ES512",
+	"EdDSA",
+}
+
+// DefaultSigningAlgorithms returns the signing algorithms accepted when the operator configures
+// none. It stays limited to RS256 so that upgrading does not widen the set of signatures an
+// existing deployment trusts.
+func DefaultSigningAlgorithms() []string {
+	return []string{"RS256"}
+}
+
+// SupportedSigningAlgorithms returns the signing algorithms an operator may configure.
+func SupportedSigningAlgorithms() []string {
+	return slices.Clone(supportedSigningAlgorithms)
+}
+
+// ValidateSigningAlgorithms returns an error unless every given algorithm is one OpenFGA accepts
+// for OIDC token verification. An empty slice is valid and means DefaultSigningAlgorithms applies.
+//
+// Entries are compared verbatim. Nothing here trims whitespace, matching how the neighbouring OIDC
+// settings treat it as significant, so `RS256, ES256` in a config file or environment variable is
+// reported as an unsupported algorithm rather than quietly accepted.
+func ValidateSigningAlgorithms(signingAlgorithms []string) error {
+	for _, signingAlgorithm := range signingAlgorithms {
+		if !slices.Contains(supportedSigningAlgorithms, signingAlgorithm) {
+			return fmt.Errorf("%w %q, expected one of %v", ErrUnsupportedSigningAlgorithm, signingAlgorithm, supportedSigningAlgorithms)
+		}
+	}
+
+	return nil
+}
 
 var _ authn.Authenticator = (*RemoteOidcAuthenticator)(nil)
 var _ authn.OIDCAuthenticator = (*RemoteOidcAuthenticator)(nil)
 
-func NewRemoteOidcAuthenticator(mainIssuer string, issuerAliases []string, audience string, subjects []string, clientIDClaims []string) (*RemoteOidcAuthenticator, error) {
+func NewRemoteOidcAuthenticator(mainIssuer string, issuerAliases []string, audience string, subjects []string, clientIDClaims []string, opts ...RemoteOidcAuthenticatorOption) (*RemoteOidcAuthenticator, error) {
 	// both issuer and audience are StringOrURI values (RFC 7519 §4.1.1, §4.1.3); whitespace is valid, so only reject strictly empty
 	if mainIssuer == "" {
 		return nil, ErrMissingIssuer
@@ -65,12 +119,26 @@ func NewRemoteOidcAuthenticator(mainIssuer string, issuerAliases []string, audie
 	client := retryablehttp.NewClient()
 	client.Logger = nil
 	oidc := &RemoteOidcAuthenticator{
-		MainIssuer:     mainIssuer,
-		IssuerAliases:  issuerAliases,
-		Audience:       audience,
-		Subjects:       subjects,
-		httpClient:     client.StandardClient(),
-		ClientIDClaims: clientIDClaims,
+		MainIssuer:        mainIssuer,
+		IssuerAliases:     issuerAliases,
+		Audience:          audience,
+		Subjects:          subjects,
+		httpClient:        client.StandardClient(),
+		ClientIDClaims:    clientIDClaims,
+		SigningAlgorithms: DefaultSigningAlgorithms(),
+	}
+
+	for _, opt := range opts {
+		opt(oidc)
+	}
+
+	if len(oidc.SigningAlgorithms) == 0 {
+		oidc.SigningAlgorithms = DefaultSigningAlgorithms()
+	}
+
+	// validate before fetching keys so that a misconfigured algorithm fails without a network call
+	if err := ValidateSigningAlgorithms(oidc.SigningAlgorithms); err != nil {
+		return nil, err
 	}
 
 	// Client ID is:
@@ -95,8 +163,17 @@ func (oidc *RemoteOidcAuthenticator) Authenticate(requestContext context.Context
 		return nil, authn.ErrMissingBearerToken
 	}
 
+	// never hand an empty list to jwt.WithValidMethods: the parser skips the algorithm check
+	// entirely when the list is nil. Such a token is still rejected today, because verification
+	// would receive a key of the wrong type, but the accepted algorithms should be enforced here
+	// rather than left to that coincidence.
+	signingAlgorithms := oidc.SigningAlgorithms
+	if len(signingAlgorithms) == 0 {
+		signingAlgorithms = DefaultSigningAlgorithms()
+	}
+
 	options := []jwt.ParserOption{
-		jwt.WithValidMethods([]string{"RS256"}),
+		jwt.WithValidMethods(signingAlgorithms),
 		jwt.WithIssuedAt(),
 		jwt.WithExpirationRequired(),
 	}
