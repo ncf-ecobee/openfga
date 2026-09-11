@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
@@ -775,7 +776,6 @@ func TestRemoteOidcAuthenticator_Authenticate_SigningAlgorithms(t *testing.T) {
 // own and the authenticator's accepted-algorithms list is the only thing under test.
 func withSymmetricJWKS(t *testing.T) (issuerURL, signedToken string) {
 	t.Helper()
-	withRealFetchJWK(t)
 
 	const kid = "symmetric_kid"
 
@@ -783,16 +783,36 @@ func withSymmetricJWKS(t *testing.T) (issuerURL, signedToken string) {
 	_, err := rand.Read(secret)
 	require.NoError(t, err)
 
+	issuerURL = serveJWKS(t, map[string]string{
+		"kty": "oct",
+		"use": "sig",
+		"kid": kid,
+		"k":   base64.RawURLEncoding.EncodeToString(secret),
+	})
+
+	claims := validClaims()
+	claims["iss"] = issuerURL
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token.Header["kid"] = kid
+	signedToken, err = token.SignedString(secret)
+	require.NoError(t, err)
+
+	return issuerURL, signedToken
+}
+
+// serveJWKS stands up an issuer publishing exactly the given JWK, and returns its URL. Going through
+// real JWKS JSON matters: fetchKeysMockForAlgorithm hands keyfunc an already-parsed key, so a test
+// built on it never exercises keyfunc's ability to parse the JWK shape in question.
+func serveJWKS(t *testing.T, jwk map[string]string) string {
+	t.Helper()
+	withRealFetchJWK(t)
+
 	var server *httptest.Server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
-			"kty": "oct",
-			"use": "sig",
-			"kid": kid,
-			"k":   base64.RawURLEncoding.EncodeToString(secret),
-		}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{jwk}})
 	})
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -804,15 +824,107 @@ func withSymmetricJWKS(t *testing.T) (issuerURL, signedToken string) {
 	server = httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
-	claims := validClaims()
-	claims["iss"] = server.URL
+	return server.URL
+}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	token.Header["kid"] = kid
-	signedToken, err = token.SignedString(secret)
+// TestRemoteOidcAuthenticator_Authenticate_EverySupportedAlgorithm checks that every algorithm
+// SupportedSigningAlgorithms advertises can actually verify a token, from the published JWKS through
+// to the signature. It iterates the list itself, so adding an algorithm there without a working
+// verification path fails rather than shipping a setting that rejects every token.
+func TestRemoteOidcAuthenticator_Authenticate_EverySupportedAlgorithm(t *testing.T) {
+	// one key serves all six RSA-family algorithms; generating six would dominate the runtime
+	rsaPrivateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
 
-	return server.URL, signedToken
+	algorithms := SupportedSigningAlgorithms()
+	require.NotEmpty(t, algorithms)
+
+	for _, algorithm := range algorithms {
+		t.Run(algorithm, func(t *testing.T) {
+			privateKey, jwk := signingKeyForAlgorithm(t, algorithm, rsaPrivateKey)
+			issuerURL := serveJWKS(t, jwk)
+
+			authenticator, err := NewRemoteOidcAuthenticator(issuerURL, nil, "right_audience", nil, nil,
+				WithSigningAlgorithms([]string{algorithm}))
+			require.NoError(t, err)
+			t.Cleanup(authenticator.Close)
+
+			claims := validClaims()
+			claims["iss"] = issuerURL
+
+			token := jwt.NewWithClaims(jwt.GetSigningMethod(algorithm), claims)
+			token.Header["kid"] = jwk["kid"]
+			signedToken, err := token.SignedString(privateKey)
+			require.NoError(t, err)
+
+			authClaims, err := authenticator.Authenticate(generateContext(signedToken))
+			require.NoError(t, err)
+			require.Equal(t, "openfga client", authClaims.Subject)
+		})
+	}
+}
+
+// signingKeyForAlgorithm returns a private key able to sign for the given algorithm, and the JWK
+// (RFC 7517) an issuer would publish for the matching public key. The RSA family shares the caller's
+// key, since the six differ only in hash and padding rather than in key material.
+func signingKeyForAlgorithm(t *testing.T, algorithm string, rsaPrivateKey *rsa.PrivateKey) (crypto.Signer, map[string]string) {
+	t.Helper()
+
+	kid := "kid_" + algorithm
+
+	switch algorithm {
+	case "RS256", "RS384", "RS512", "PS256", "PS384", "PS512":
+		return rsaPrivateKey, map[string]string{
+			"kty": "RSA",
+			"use": "sig",
+			"kid": kid,
+			"n":   base64.RawURLEncoding.EncodeToString(rsaPrivateKey.N.Bytes()),
+			"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(rsaPrivateKey.E)).Bytes()),
+		}
+
+	case "ES256", "ES384", "ES512":
+		curves := map[string]struct {
+			curve elliptic.Curve
+			name  string
+		}{
+			"ES256": {elliptic.P256(), "P-256"},
+			"ES384": {elliptic.P384(), "P-384"},
+			"ES512": {elliptic.P521(), "P-521"},
+		}
+		curve := curves[algorithm]
+
+		privateKey, err := ecdsa.GenerateKey(curve.curve, rand.Reader)
+		require.NoError(t, err)
+
+		// coordinates are padded to the curve's byte length, per
+		// https://www.rfc-editor.org/rfc/rfc7518#section-6.2.1.2. P-521 makes this visible: roughly
+		// three quarters of its keys have a coordinate whose unpadded encoding is a byte short.
+		coordinateLength := (curve.curve.Params().BitSize + 7) / 8
+		return privateKey, map[string]string{
+			"kty": "EC",
+			"use": "sig",
+			"crv": curve.name,
+			"kid": kid,
+			"x":   base64.RawURLEncoding.EncodeToString(privateKey.X.FillBytes(make([]byte, coordinateLength))),
+			"y":   base64.RawURLEncoding.EncodeToString(privateKey.Y.FillBytes(make([]byte, coordinateLength))),
+		}
+
+	case "EdDSA":
+		publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+		require.NoError(t, err)
+
+		return privateKey, map[string]string{
+			"kty": "OKP",
+			"use": "sig",
+			"crv": "Ed25519",
+			"kid": kid,
+			"x":   base64.RawURLEncoding.EncodeToString(publicKey),
+		}
+
+	default:
+		t.Fatalf("no key generator for supported algorithm %q; add one alongside the algorithm itself", algorithm)
+		return nil, nil
+	}
 }
 
 // signingAlgorithmSetup builds an authenticator that trusts signingAlgorithms, whose issuer
