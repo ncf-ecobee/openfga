@@ -227,6 +227,10 @@ type AuthnOIDCConfig struct {
 	Subjects       []string
 	Audience       string
 	ClientIDClaims []string
+
+	// SigningAlgorithms are the JWT signing algorithms accepted when verifying tokens. Only
+	// asymmetric algorithms may be listed; see oidc.SupportedSigningAlgorithms.
+	SigningAlgorithms []string
 }
 
 // AuthnPresharedKeyConfig defines configurations for the 'preshared' method of authentication.
@@ -907,7 +911,11 @@ func DefaultConfig() *Config {
 		Authn: AuthnConfig{
 			Method:                  "none",
 			AuthnPresharedKeyConfig: &AuthnPresharedKeyConfig{},
-			AuthnOIDCConfig:         &AuthnOIDCConfig{},
+			AuthnOIDCConfig: &AuthnOIDCConfig{
+				// kept in step with oidc.DefaultSigningAlgorithms, which the authenticator applies
+				// when this is empty; asserted by TestDefaultConfigSigningAlgorithmsMatchOIDCDefault
+				SigningAlgorithms: []string{"RS256"},
+			},
 		},
 		Log: LogConfig{
 			Format:          "text",

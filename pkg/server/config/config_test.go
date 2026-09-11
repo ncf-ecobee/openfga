@@ -9,6 +9,8 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
+
+	"github.com/openfga/openfga/internal/authn/oidc"
 )
 
 func TestVerifyConfig(t *testing.T) {
@@ -1238,6 +1240,12 @@ func TestVerifyBinarySettings(t *testing.T) {
 		err := cfg.VerifyBinarySettings()
 		require.NoError(t, err)
 	})
+}
+
+// The default is spelled out in this package so that it keeps no dependency on the authn packages.
+// It must therefore not drift from the value the authenticator falls back to on an empty list.
+func TestDefaultConfigSigningAlgorithmsMatchOIDCDefault(t *testing.T) {
+	require.Equal(t, oidc.DefaultSigningAlgorithms(), DefaultConfig().Authn.SigningAlgorithms)
 }
 
 func TestVerifyBinarySettings_TraceSampler(t *testing.T) {

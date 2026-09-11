@@ -679,6 +679,60 @@ func TestBuildServerWithOIDCAuthenticationAlias(t *testing.T) {
 	})
 }
 
+func TestBuildServerWithOIDCAuthenticationES256(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t)
+	})
+	oidcServerPort, oidcServerPortReleaser := testutils.TCPRandomPort()
+	localOIDCServerURL := fmt.Sprintf("http://localhost:%d", oidcServerPort)
+
+	cfg := testutils.MustDefaultConfigWithRandomPorts()
+	cfg.Authn.Method = "oidc"
+	cfg.Authn.AuthnOIDCConfig = &serverconfig.AuthnOIDCConfig{
+		Audience:          "openfga.dev",
+		Issuer:            localOIDCServerURL,
+		SigningAlgorithms: []string{"ES256"},
+	}
+
+	oidcServerPortReleaser()
+
+	trustedIssuerServer, err := mocks.NewMockOidcServerWithAlgorithm(localOIDCServerURL, "ES256")
+	require.NoError(t, err)
+	t.Cleanup(trustedIssuerServer.Stop)
+
+	trustedToken, err := trustedIssuerServer.GetToken("openfga.dev", "some-user")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		if err := runServer(ctx, cfg); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	testutils.EnsureServiceHealthy(t, cfg.GRPC.Addr, cfg.HTTP.Addr, nil)
+
+	retryClient := retryablehttp.NewClient()
+	t.Cleanup(retryClient.HTTPClient.CloseIdleConnections)
+
+	// rejection paths are covered by the unit tests in internal/authn/oidc; what this asserts is
+	// that a configured algorithm reaches the authenticator and verifies against an EC JWKS
+	test := authTest{
+		_name:              "Token_signed_with_ES256_is_accepted",
+		authHeader:         "Bearer " + trustedToken,
+		expectedStatusCode: 200,
+	}
+	t.Run(test._name, func(t *testing.T) {
+		tryGetStores(t, test, cfg.HTTP.Addr, retryClient)
+	})
+
+	t.Run(test._name+"/streaming", func(t *testing.T) {
+		tryStreamingListObjects(t, test, cfg.HTTP.Addr, retryClient, trustedToken)
+	})
+}
+
 func TestHTTPServingTLS(t *testing.T) {
 	t.Cleanup(func() {
 		goleak.VerifyNone(t)
@@ -1614,6 +1668,69 @@ func TestParseConfigCacheTTLJitterPercentageFromEnv(t *testing.T) {
 	cfg, err := ReadConfig()
 	require.NoError(t, err)
 	require.Equal(t, uint32(18), cfg.CacheTTLJitterPercentage)
+}
+
+func TestParseConfigAuthnOIDCSigningAlgorithmsDefault(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	util.PrepareTempConfigDir(t)
+
+	runCmd := NewRunCommand()
+	runCmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		return nil
+	}
+
+	rootCmd := cmd.NewRootCommand()
+	rootCmd.AddCommand(runCmd)
+	rootCmd.SetArgs([]string{"run"})
+	require.NoError(t, rootCmd.Execute())
+
+	cfg, err := ReadConfig()
+	require.NoError(t, err)
+	require.Equal(t, []string{"RS256"}, cfg.Authn.SigningAlgorithms)
+}
+
+func TestParseConfigAuthnOIDCSigningAlgorithmsFromFlag(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	util.PrepareTempConfigDir(t)
+
+	runCmd := NewRunCommand()
+	runCmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		return nil
+	}
+
+	rootCmd := cmd.NewRootCommand()
+	rootCmd.AddCommand(runCmd)
+	rootCmd.SetArgs([]string{"run", "--authn-oidc-signing-algorithms=RS256,ES256"})
+	require.NoError(t, rootCmd.Execute())
+
+	cfg, err := ReadConfig()
+	require.NoError(t, err)
+	require.Equal(t, []string{"RS256", "ES256"}, cfg.Authn.SigningAlgorithms)
+}
+
+func TestParseConfigAuthnOIDCSigningAlgorithmsFromEnv(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	util.PrepareTempConfigDir(t)
+	// the config is unmarshalled with mapstructure's comma-splitting hook, so a multi-valued
+	// environment variable is comma-separated
+	t.Setenv("OPENFGA_AUTHN_OIDC_SIGNING_ALGORITHMS", "RS256,ES256")
+
+	runCmd := NewRunCommand()
+	runCmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		return nil
+	}
+
+	rootCmd := cmd.NewRootCommand()
+	rootCmd.AddCommand(runCmd)
+	rootCmd.SetArgs([]string{"run"})
+	require.NoError(t, rootCmd.Execute())
+
+	cfg, err := ReadConfig()
+	require.NoError(t, err)
+	require.Equal(t, []string{"RS256", "ES256"}, cfg.Authn.SigningAlgorithms)
 }
 
 func TestRunCommandConfigIsMerged(t *testing.T) {
