@@ -2,10 +2,14 @@ package mocks
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math/big"
 	"net/http"
@@ -17,29 +21,39 @@ import (
 )
 
 type mockOidcServer struct {
-	issuerURL  string
-	privateKey *rsa.PrivateKey
-	publicKey  *rsa.PublicKey
-	httpServer *http.Server
+	issuerURL     string
+	signingMethod jwt.SigningMethod
+	privateKey    crypto.Signer
+	jwk           map[string]string
+	httpServer    *http.Server
 }
 
 const kidHeader = "1"
 
-// NewMockOidcServer creates a mock OIDC server with the given issuer URL and a random private key.
+// NewMockOidcServer creates a mock OIDC server with the given issuer URL and a random RSA private
+// key, signing tokens with RS256.
 // You must call Stop afterward.
 func NewMockOidcServer(issuerURL string) (*mockOidcServer, error) {
-	privateKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	return NewMockOidcServerWithAlgorithm(issuerURL, "RS256")
+}
+
+// NewMockOidcServerWithAlgorithm creates a mock OIDC server with the given issuer URL and a random
+// private key for the given JWT signing algorithm. The published JWKS holds the matching public key.
+// You must call Stop afterward.
+func NewMockOidcServerWithAlgorithm(issuerURL, algorithm string) (*mockOidcServer, error) {
+	signingMethod, privateKey, jwk, err := generateSigningKey(algorithm)
 	if err != nil {
 		return nil, err
 	}
 
 	mockServer := &mockOidcServer{
-		issuerURL:  issuerURL,
-		privateKey: privateKey,
-		publicKey:  privateKey.Public().(*rsa.PublicKey),
+		issuerURL:     issuerURL,
+		signingMethod: signingMethod,
+		privateKey:    privateKey,
+		jwk:           jwk,
 	}
 
-	mockServer.httpServer = createHTTPServer(issuerURL, mockServer.publicKey)
+	mockServer.httpServer = createHTTPServer(issuerURL, jwk)
 	go mockServer.start()
 	return mockServer, nil
 }
@@ -48,17 +62,54 @@ func NewMockOidcServer(issuerURL string) (*mockOidcServer, error) {
 // You must call Stop afterward.
 func (server *mockOidcServer) NewAliasMockServer(aliasURL string) *mockOidcServer {
 	mockServer := &mockOidcServer{
-		issuerURL:  aliasURL,
-		privateKey: server.privateKey,
-		publicKey:  server.privateKey.Public().(*rsa.PublicKey),
+		issuerURL:     aliasURL,
+		signingMethod: server.signingMethod,
+		privateKey:    server.privateKey,
+		jwk:           server.jwk,
 	}
 
-	mockServer.httpServer = createHTTPServer(aliasURL, mockServer.publicKey)
+	mockServer.httpServer = createHTTPServer(aliasURL, mockServer.jwk)
 	go mockServer.start()
 	return mockServer
 }
 
-func createHTTPServer(issuerURL string, publicKey *rsa.PublicKey) *http.Server {
+// generateSigningKey returns the signing method, a freshly generated private key, and the JWK
+// (RFC 7517) describing the matching public key, for the given JWT signing algorithm.
+func generateSigningKey(algorithm string) (jwt.SigningMethod, crypto.Signer, map[string]string, error) {
+	switch algorithm {
+	case "RS256":
+		privateKey, err := rsa.GenerateKey(rand.Reader, 4096)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		publicKey := privateKey.Public().(*rsa.PublicKey)
+		return jwt.SigningMethodRS256, privateKey, map[string]string{
+			"kid": kidHeader,
+			"kty": "RSA",
+			"n":   base64.RawURLEncoding.EncodeToString(publicKey.N.Bytes()),
+			"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(publicKey.E)).Bytes()),
+		}, nil
+	case "ES256":
+		privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		publicKey := privateKey.Public().(*ecdsa.PublicKey)
+		// RFC 7518 §6.2.1.2 requires each coordinate to be padded to the full byte length of the curve
+		coordinateLength := (publicKey.Curve.Params().BitSize + 7) / 8
+		return jwt.SigningMethodES256, privateKey, map[string]string{
+			"kid": kidHeader,
+			"kty": "EC",
+			"crv": "P-256",
+			"x":   base64.RawURLEncoding.EncodeToString(publicKey.X.FillBytes(make([]byte, coordinateLength))),
+			"y":   base64.RawURLEncoding.EncodeToString(publicKey.Y.FillBytes(make([]byte, coordinateLength))),
+		}, nil
+	default:
+		return nil, nil, nil, fmt.Errorf("mock OIDC server does not support signing algorithm %q", algorithm)
+	}
+}
+
+func createHTTPServer(issuerURL string, jwk map[string]string) *http.Server {
 	addr := strings.Split(issuerURL, "http://")[1]
 
 	mockHandler := http.NewServeMux()
@@ -75,14 +126,7 @@ func createHTTPServer(issuerURL string, publicKey *rsa.PublicKey) *http.Server {
 
 	mockHandler.HandleFunc("/jwks.json", func(w http.ResponseWriter, r *http.Request) {
 		err := json.NewEncoder(w).Encode(map[string]interface{}{
-			"keys": []map[string]string{
-				{
-					"kid": kidHeader,
-					"kty": "RSA",
-					"n":   base64.RawURLEncoding.EncodeToString(publicKey.N.Bytes()),
-					"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(publicKey.E)).Bytes()),
-				},
-			},
+			"keys": []map[string]string{jwk},
 		})
 		if err != nil {
 			log.Fatalf("failed to json encode the jwks keys: %v", err)
@@ -108,7 +152,7 @@ func (server *mockOidcServer) Stop() {
 }
 
 func (server *mockOidcServer) GetToken(audience, subject string) (string, error) {
-	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.RegisteredClaims{
+	token := jwt.NewWithClaims(server.signingMethod, jwt.RegisteredClaims{
 		Issuer:    server.issuerURL,
 		Audience:  []string{audience},
 		Subject:   subject,
