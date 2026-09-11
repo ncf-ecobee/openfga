@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Try to keep listed changes to a concise bulleted list of simple explanations of changes. Aim for the amount of information needed so that readers can understand where they would look in the codebase to investigate the changes' implementation, or where they would look in the documentation to understand how to make use of the change in practice - better yet, link directly to the docs and provide detailed information there. Only elaborate if doing so is required to avoid breaking changes or experimental features from ruining someone's day.
 
 ## [Unreleased]
+### Added
+- Added `authn.oidc.signingAlgorithms` (`--authn-oidc-signing-algorithms`, `OPENFGA_AUTHN_OIDC_SIGNING_ALGORITHMS`) to configure the JWT signing algorithms accepted by the `oidc` authentication method, which previously accepted `RS256` only. Any combination of `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `ES256`, `ES384`, `ES512` and `EdDSA` may be set; symmetric algorithms and `none` are rejected at startup, because the verification key is fetched from the issuer's public JWKS. Defaults to `RS256`, so an existing deployment trusts the same signatures after upgrading. Resolves [#1871](https://github.com/openfga/openfga/issues/1871).
 
 ## [1.20.0] - 2026-09-08
 ### Added
