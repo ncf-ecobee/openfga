@@ -66,13 +66,19 @@ var (
 // supportedSigningAlgorithms lists the JWT signing algorithms an operator may configure. The set is
 // every signing method golang-jwt registers, minus the symmetric ones and "none", so it is what this
 // codebase can actually verify rather than a curated selection. Each entry is a registered JWS "alg"
-// value (RFC 7518 §3.1, plus RFC 8037 for EdDSA) and names a scheme FIPS 186-5 approves.
+// value ([RFC 7518 §3.1], plus [RFC 8037] for EdDSA) and names a scheme [FIPS 186-5] approves.
 //
-// Excluding the HS family departs from RFC 7518 §3.1, which marks HS256 Required, and does so
+// Excluding the HS family departs from [RFC 7518 §3.1], which marks HS256 Required, and does so
 // deliberately. The verification key here comes from the issuer's public JWKS, and keyfunc decodes a
 // symmetric ("oct") JWK to a byte slice, which is exactly what HMAC verification accepts. An issuer
 // publishing such a key would therefore let anyone able to read the JWKS sign tokens that verify.
-// See RFC 8725 §2.1 and §3.1.
+// See [RFC 8725 §2.1] and [RFC 8725 §3.1].
+//
+// [RFC 7518 §3.1]: https://www.rfc-editor.org/rfc/rfc7518#section-3.1
+// [RFC 8037]: https://www.rfc-editor.org/rfc/rfc8037
+// [FIPS 186-5]: https://doi.org/10.6028/NIST.FIPS.186-5
+// [RFC 8725 §2.1]: https://www.rfc-editor.org/rfc/rfc8725#section-2.1
+// [RFC 8725 §3.1]: https://www.rfc-editor.org/rfc/rfc8725#section-3.1
 var supportedSigningAlgorithms = []string{
 	"RS256", "RS384", "RS512",
 	"PS256", "PS384", "PS512",

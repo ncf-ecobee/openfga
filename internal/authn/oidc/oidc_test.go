@@ -702,7 +702,8 @@ func TestRemoteOidcAuthenticator_Authenticate_SigningAlgorithms(t *testing.T) {
 		})
 	}
 
-	// RFC 8725 §2.1: the verification key is public, so an HMAC-signed token must never be trusted
+	// the verification key is public, so an HMAC-signed token must never be trusted, per
+	// https://www.rfc-editor.org/rfc/rfc8725#section-2.1
 	t.Run("an_HS256_token_signed_with_the_issuer's_public_key_is_rejected", func(t *testing.T) {
 		publicKey := withMockedJWKS(t)
 

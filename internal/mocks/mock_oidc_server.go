@@ -74,7 +74,9 @@ func (server *mockOidcServer) NewAliasMockServer(aliasURL string) *mockOidcServe
 }
 
 // generateSigningKey returns the signing method, a freshly generated private key, and the JWK
-// (RFC 7517) describing the matching public key, for the given JWT signing algorithm.
+// ([RFC 7517]) describing the matching public key, for the given JWT signing algorithm.
+//
+// [RFC 7517]: https://www.rfc-editor.org/rfc/rfc7517
 func generateSigningKey(algorithm string) (jwt.SigningMethod, crypto.Signer, map[string]string, error) {
 	switch algorithm {
 	case "RS256":
@@ -95,7 +97,8 @@ func generateSigningKey(algorithm string) (jwt.SigningMethod, crypto.Signer, map
 			return nil, nil, nil, err
 		}
 		publicKey := privateKey.Public().(*ecdsa.PublicKey)
-		// RFC 7518 §6.2.1.2 requires each coordinate to be padded to the full byte length of the curve
+		// each coordinate must be padded to the full byte length of the curve, per
+		// https://www.rfc-editor.org/rfc/rfc7518#section-6.2.1.2
 		coordinateLength := (publicKey.Curve.Params().BitSize + 7) / 8
 		return jwt.SigningMethodES256, privateKey, map[string]string{
 			"kid": kidHeader,
