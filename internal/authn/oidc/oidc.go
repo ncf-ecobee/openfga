@@ -63,18 +63,27 @@ var (
 	ErrUnsupportedSigningAlgorithm = errors.New("oidc: unsupported signing algorithm")
 )
 
-// supportedSigningAlgorithms lists the JWT signing algorithms an operator may configure.
+// supportedSigningAlgorithms lists the JWT signing algorithms an operator may configure. The set is
+// every signing method golang-jwt registers, minus the symmetric ones and "none", so it is what this
+// codebase can actually verify rather than a curated selection. Each entry is a registered JWS "alg"
+// value (RFC 7518 §3.1, plus RFC 8037 for EdDSA) and names a scheme FIPS 186-5 approves.
 //
-// Every entry is asymmetric on purpose. A symmetric algorithm (the HS family) or "none" must never
-// be accepted here: the verification key comes from the issuer's public JWKS, so an HMAC algorithm
-// would let anyone who can read that JWKS sign a token with the published public key and have it
-// accepted as genuine. See RFC 8725 §2.1 and §3.1.
+// Excluding the HS family departs from RFC 7518 §3.1, which marks HS256 Required, and does so
+// deliberately. The verification key here comes from the issuer's public JWKS, and keyfunc decodes a
+// symmetric ("oct") JWK to a byte slice, which is exactly what HMAC verification accepts. An issuer
+// publishing such a key would therefore let anyone able to read the JWKS sign tokens that verify.
+// See RFC 8725 §2.1 and §3.1.
 var supportedSigningAlgorithms = []string{
 	"RS256", "RS384", "RS512",
 	"PS256", "PS384", "PS512",
 	"ES256", "ES384", "ES512",
 	"EdDSA",
 }
+
+// refusedSigningAlgorithms are the registered signing methods deliberately left out of
+// supportedSigningAlgorithms. They are named so that configuring one draws an explanation rather
+// than an error that reads like an unimplemented feature.
+var refusedSigningAlgorithms = []string{"HS256", "HS384", "HS512", "none"}
 
 // DefaultSigningAlgorithms returns the signing algorithms accepted when the operator configures
 // none. It stays limited to RS256 so that upgrading does not widen the set of signatures an
@@ -96,9 +105,16 @@ func SupportedSigningAlgorithms() []string {
 // reported as an unsupported algorithm rather than quietly accepted.
 func ValidateSigningAlgorithms(signingAlgorithms []string) error {
 	for _, signingAlgorithm := range signingAlgorithms {
-		if !slices.Contains(supportedSigningAlgorithms, signingAlgorithm) {
-			return fmt.Errorf("%w %q, expected one of %v", ErrUnsupportedSigningAlgorithm, signingAlgorithm, supportedSigningAlgorithms)
+		if slices.Contains(supportedSigningAlgorithms, signingAlgorithm) {
+			continue
 		}
+
+		if slices.Contains(refusedSigningAlgorithms, signingAlgorithm) {
+			return fmt.Errorf("%w %q: the verification key is fetched from the issuer's public JWKS, so only asymmetric algorithms can be trusted, one of %v",
+				ErrUnsupportedSigningAlgorithm, signingAlgorithm, supportedSigningAlgorithms)
+		}
+
+		return fmt.Errorf("%w %q, expected one of %v", ErrUnsupportedSigningAlgorithm, signingAlgorithm, supportedSigningAlgorithms)
 	}
 
 	return nil
@@ -164,9 +180,9 @@ func (oidc *RemoteOidcAuthenticator) Authenticate(requestContext context.Context
 	}
 
 	// never hand an empty list to jwt.WithValidMethods: the parser skips the algorithm check
-	// entirely when the list is nil. Such a token is still rejected today, because verification
-	// would receive a key of the wrong type, but the accepted algorithms should be enforced here
-	// rather than left to that coincidence.
+	// entirely when the list is nil, and keyfunc decodes a symmetric ("oct") JWK to a byte slice.
+	// An issuer whose JWKS carries such a key would hand HMAC verification the very key type it
+	// accepts, so an HS256 token would verify. Re-applying the default is what prevents that.
 	signingAlgorithms := oidc.SigningAlgorithms
 	if len(signingAlgorithms) == 0 {
 		signingAlgorithms = DefaultSigningAlgorithms()

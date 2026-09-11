@@ -519,6 +519,7 @@ func TestValidateSigningAlgorithms(t *testing.T) {
 		name              string
 		signingAlgorithms []string
 		expectedErr       error
+		expectedMessage   string
 	}{
 		{
 			name:              "empty_means_the_default_applies",
@@ -540,21 +541,25 @@ func TestValidateSigningAlgorithms(t *testing.T) {
 			name:              "every_supported_algorithm_is_accepted",
 			signingAlgorithms: SupportedSigningAlgorithms(),
 		},
-		// a symmetric algorithm would let anyone holding the issuer's public key forge tokens
+		// a symmetric algorithm would let anyone holding a key from the issuer's JWKS forge tokens,
+		// so the error says why rather than leaving it to look like an unimplemented algorithm
 		{
 			name:              "HS256_is_rejected",
 			signingAlgorithms: []string{"HS256"},
 			expectedErr:       ErrUnsupportedSigningAlgorithm,
+			expectedMessage:   "only asymmetric algorithms can be trusted",
 		},
 		{
 			name:              "none_is_rejected",
 			signingAlgorithms: []string{"none"},
 			expectedErr:       ErrUnsupportedSigningAlgorithm,
+			expectedMessage:   "only asymmetric algorithms can be trusted",
 		},
 		{
 			name:              "an_unknown_algorithm_is_rejected",
 			signingAlgorithms: []string{"not-an-algorithm"},
 			expectedErr:       ErrUnsupportedSigningAlgorithm,
+			expectedMessage:   "expected one of",
 		},
 		{
 			name:              "algorithm_names_are_case_sensitive",
@@ -583,6 +588,9 @@ func TestValidateSigningAlgorithms(t *testing.T) {
 				return
 			}
 			require.ErrorIs(t, err, tc.expectedErr)
+			if tc.expectedMessage != "" {
+				require.Contains(t, err.Error(), tc.expectedMessage)
+			}
 		})
 	}
 }
@@ -722,6 +730,88 @@ func TestRemoteOidcAuthenticator_Authenticate_SigningAlgorithms(t *testing.T) {
 		_, err := authenticator.Authenticate(generateContext(forgeHS256Token(t, publicKey)))
 		require.ErrorIs(t, err, errInvalidClaims)
 	})
+
+	// The two cases above forge a token from a key the JWKS publishes as asymmetric, so HMAC
+	// verification is handed an *rsa.PublicKey and fails on the key type alone, whatever the
+	// accepted algorithms say. An issuer publishing an "oct" JWK removes that accident: keyfunc
+	// decodes it to a byte slice, which HMAC verification accepts, so only the accepted-algorithms
+	// list stands between the token and a successful verification.
+	t.Run("an_HS256_token_signed_with_a_symmetric_key_from_the_JWKS_is_rejected", func(t *testing.T) {
+		issuerURL, token := withSymmetricJWKS(t)
+
+		authenticator, err := NewRemoteOidcAuthenticator(issuerURL, nil, "right_audience", nil, nil)
+		require.NoError(t, err)
+		t.Cleanup(authenticator.Close)
+		require.Equal(t, DefaultSigningAlgorithms(), authenticator.SigningAlgorithms)
+
+		_, err = authenticator.Authenticate(generateContext(token))
+		require.ErrorIs(t, err, errInvalidClaims)
+	})
+
+	// Authenticate re-applies the default when SigningAlgorithms is empty. Drop that and this token
+	// is accepted, because jwt skips the algorithm check for a nil list and the JWKS supplies a
+	// working HMAC key.
+	t.Run("an_authenticator_with_no_signing_algorithms_set_rejects_a_symmetric_JWKS_token", func(t *testing.T) {
+		issuerURL, token := withSymmetricJWKS(t)
+
+		authenticator := &RemoteOidcAuthenticator{
+			MainIssuer: issuerURL,
+			Audience:   "right_audience",
+			httpClient: http.DefaultClient,
+		}
+		require.NoError(t, fetchJWK(authenticator))
+		t.Cleanup(authenticator.Close)
+		require.Empty(t, authenticator.SigningAlgorithms)
+
+		_, err := authenticator.Authenticate(generateContext(token))
+		require.ErrorIs(t, err, errInvalidClaims)
+	})
+}
+
+// withSymmetricJWKS stands up an issuer whose JWKS publishes a single symmetric ("oct") key, and
+// returns the issuer URL along with an HS256 token signed with that key whose claims are otherwise
+// valid. The JWKS omits "alg", as many real issuers do, so keyfunc applies no algorithm check of its
+// own and the authenticator's accepted-algorithms list is the only thing under test.
+func withSymmetricJWKS(t *testing.T) (issuerURL, signedToken string) {
+	t.Helper()
+	withRealFetchJWK(t)
+
+	const kid = "symmetric_kid"
+
+	secret := make([]byte, 32)
+	_, err := rand.Read(secret)
+	require.NoError(t, err)
+
+	var server *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
+			"kty": "oct",
+			"use": "sig",
+			"kid": kid,
+			"k":   base64.RawURLEncoding.EncodeToString(secret),
+		}}})
+	})
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":   server.URL,
+			"jwks_uri": server.URL + "/jwks",
+		})
+	})
+	server = httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	claims := validClaims()
+	claims["iss"] = server.URL
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token.Header["kid"] = kid
+	signedToken, err = token.SignedString(secret)
+	require.NoError(t, err)
+
+	return server.URL, signedToken
 }
 
 // signingAlgorithmSetup builds an authenticator that trusts signingAlgorithms, whose issuer
